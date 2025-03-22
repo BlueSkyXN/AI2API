@@ -29,8 +29,14 @@ type Config struct {
 	MaxRetries   int    // 最大重试次数
 	Timeout      int    // 请求超时时间(秒)
 	VerifySSL    bool   // 是否验证SSL证书
-	ModelName    string // 模型名称
+	ModelName    string // 默认模型名称
 	BearerToken  string // Bearer Token (默认提供公开Token)
+}
+
+// 支持的模型列表
+var SupportedModels = []string{
+	"hunyuan-t1-latest",
+	"hunyuan-turbos-latest",
 }
 
 // 腾讯混元 API 目标URL
@@ -57,7 +63,7 @@ func parseFlags() *Config {
 	flag.IntVar(&cfg.MaxRetries, "max-retries", 3, "Maximum number of retries for failed requests")
 	flag.IntVar(&cfg.Timeout, "timeout", 300, "Request timeout in seconds")
 	flag.BoolVar(&cfg.VerifySSL, "verify-ssl", true, "Verify SSL certificates")
-	flag.StringVar(&cfg.ModelName, "model", "hunyuan-t1-latest", "Hunyuan model name")
+	flag.StringVar(&cfg.ModelName, "model", "hunyuan-t1-latest", "Default Hunyuan model name")
 	flag.StringVar(&cfg.BearerToken, "token", "7auGXNATFSKl7dF", "Bearer token for Hunyuan API")
 	flag.Parse()
 	
@@ -234,8 +240,8 @@ func main() {
 	// 初始化日志
 	initLogger(appConfig.LogLevel)
 
-	logInfo("启动服务: TargetURL=%s, Address=%s, Port=%s, Version=%s, LogLevel=%s, BearerToken=***",
-		TargetURL, appConfig.Address, appConfig.Port, Version, appConfig.LogLevel)
+	logInfo("启动服务: TargetURL=%s, Address=%s, Port=%s, Version=%s, LogLevel=%s, 支持模型=%v, BearerToken=***",
+		TargetURL, appConfig.Address, appConfig.Port, Version, appConfig.LogLevel, SupportedModels)
 
 	// 配置更高的并发处理能力
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 100
@@ -415,6 +421,16 @@ func generateQueryID() string {
 	return fmt.Sprintf("%s%d", getRandomString(8), time.Now().UnixNano())
 }
 
+// 判断模型是否在支持列表中
+func isModelSupported(modelName string) bool {
+	for _, supportedModel := range SupportedModels {
+		if modelName == supportedModel {
+			return true
+		}
+	}
+	return false
+}
+
 // 处理模型列表请求
 func handleModelsRequest(w http.ResponseWriter, r *http.Request) {
 	logInfo("处理模型列表请求")
@@ -423,21 +439,25 @@ func handleModelsRequest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
+	// 构建模型数据
+	modelData := make([]map[string]interface{}, 0, len(SupportedModels))
+	for _, model := range SupportedModels {
+		modelData = append(modelData, map[string]interface{}{
+			"id":       model,
+			"object":   "model",
+			"created":  time.Now().Unix(),
+			"owned_by": "TencentCloud",
+			"capabilities": map[string]interface{}{
+				"chat":        true,
+				"completions": true,
+				"reasoning":   true,
+			},
+		})
+	}
+
 	modelsList := map[string]interface{}{
 		"object": "list",
-		"data": []map[string]interface{}{
-			{
-				"id":       "hunyuan-t1-latest",
-				"object":   "model",
-				"created":  time.Now().Unix(),
-				"owned_by": "TencentCloud",
-				"capabilities": map[string]interface{}{
-					"chat":         true,
-					"completions":  true,
-					"reasoning":    true,
-				},
-			},
-		},
+		"data":   modelData,
 	}
 
 	json.NewEncoder(w).Encode(modelsList)
@@ -468,10 +488,23 @@ func handleChatCompletionRequest(w http.ResponseWriter, r *http.Request) {
 	// 是否使用流式处理
 	isStream := apiReq.Stream
 
+	// 确定使用的模型
+	modelName := appConfig.ModelName
+	if apiReq.Model != "" {
+		// 检查请求的模型是否是我们支持的
+		if isModelSupported(apiReq.Model) {
+			modelName = apiReq.Model
+		} else {
+			logWarn("[reqID:%s] 请求的模型 %s 不支持，使用默认模型 %s", reqID, apiReq.Model, modelName)
+		}
+	}
+	
+	logInfo("[reqID:%s] 使用模型: %s", reqID, modelName)
+
 	// 创建混元API请求
 	hunyuanReq := HunyuanRequest{
 		Stream:            true, // 混元API总是使用流式响应
-		Model:             appConfig.ModelName,
+		Model:             modelName,
 		QueryID:           generateQueryID(),
 		Messages:          apiReq.Messages,
 		StreamModeration:  true,
@@ -593,7 +626,7 @@ func handleStreamingRequest(w http.ResponseWriter, r *http.Request, hunyuanReq H
 	}
 	
 	// 发送角色块
-	roleChunk := createRoleChunk(respID, createdTime)
+	roleChunk := createRoleChunk(respID, createdTime, hunyuanReq.Model)
 	w.Write([]byte("data: " + string(roleChunk) + "\n\n"))
 	flusher.Flush()
 	
@@ -643,14 +676,14 @@ func handleStreamingRequest(w http.ResponseWriter, r *http.Request, hunyuanReq H
 			for _, choice := range hunyuanResp.Choices {
 				if choice.Delta.Content != "" {
 					// 发送内容块
-					contentChunk := createContentChunk(respID, createdTime, choice.Delta.Content)
+					contentChunk := createContentChunk(respID, createdTime, hunyuanReq.Model, choice.Delta.Content)
 					w.Write([]byte("data: " + string(contentChunk) + "\n\n"))
 					flusher.Flush()
 				}
 				
 				if choice.Delta.ReasoningContent != "" {
 					// 发送推理内容块
-					reasoningChunk := createReasoningChunk(respID, createdTime, choice.Delta.ReasoningContent)
+					reasoningChunk := createReasoningChunk(respID, createdTime, hunyuanReq.Model, choice.Delta.ReasoningContent)
 					w.Write([]byte("data: " + string(reasoningChunk) + "\n\n"))
 					flusher.Flush()
 				}
@@ -659,7 +692,7 @@ func handleStreamingRequest(w http.ResponseWriter, r *http.Request, hunyuanReq H
 				if choice.FinishReason != nil {
 					finishReason := *choice.FinishReason
 					if finishReason != "" {
-						doneChunk := createDoneChunk(respID, createdTime, finishReason)
+						doneChunk := createDoneChunk(respID, createdTime, hunyuanReq.Model, finishReason)
 						w.Write([]byte("data: " + string(doneChunk) + "\n\n"))
 						flusher.Flush()
 					}
@@ -670,7 +703,7 @@ func handleStreamingRequest(w http.ResponseWriter, r *http.Request, hunyuanReq H
 	
 	// 发送结束信号（如果没有正常结束）
 	finishReason := "stop"
-	doneChunk := createDoneChunk(respID, createdTime, finishReason)
+	doneChunk := createDoneChunk(respID, createdTime, hunyuanReq.Model, finishReason)
 	w.Write([]byte("data: " + string(doneChunk) + "\n\n"))
 	w.Write([]byte("data: [DONE]\n\n"))
 	flusher.Flush()
@@ -830,12 +863,12 @@ func extractFullContentFromStream(bodyBytes []byte, reqID string) (string, strin
 }
 
 // 创建角色块
-func createRoleChunk(id string, created int64) []byte {
+func createRoleChunk(id string, created int64, model string) []byte {
 	chunk := StreamChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
 		Created: created,
-		Model:   appConfig.ModelName,
+		Model:   model,
 		Choices: []struct {
 			Index        int     `json:"index"`
 			FinishReason *string `json:"finish_reason,omitempty"`
@@ -863,12 +896,12 @@ func createRoleChunk(id string, created int64) []byte {
 }
 
 // 创建内容块
-func createContentChunk(id string, created int64, content string) []byte {
+func createContentChunk(id string, created int64, model string, content string) []byte {
 	chunk := StreamChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
 		Created: created,
-		Model:   appConfig.ModelName,
+		Model:   model,
 		Choices: []struct {
 			Index        int     `json:"index"`
 			FinishReason *string `json:"finish_reason,omitempty"`
@@ -896,12 +929,12 @@ func createContentChunk(id string, created int64, content string) []byte {
 }
 
 // 创建推理内容块
-func createReasoningChunk(id string, created int64, reasoningContent string) []byte {
+func createReasoningChunk(id string, created int64, model string, reasoningContent string) []byte {
 	chunk := StreamChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
 		Created: created,
-		Model:   appConfig.ModelName,
+		Model:   model,
 		Choices: []struct {
 			Index        int     `json:"index"`
 			FinishReason *string `json:"finish_reason,omitempty"`
@@ -929,13 +962,13 @@ func createReasoningChunk(id string, created int64, reasoningContent string) []b
 }
 
 // 创建完成块
-func createDoneChunk(id string, created int64, reason string) []byte {
+func createDoneChunk(id string, created int64, model string, reason string) []byte {
 	finishReason := reason
 	chunk := StreamChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
 		Created: created,
-		Model:   appConfig.ModelName,
+		Model:   model,
 		Choices: []struct {
 			Index        int     `json:"index"`
 			FinishReason *string `json:"finish_reason,omitempty"`

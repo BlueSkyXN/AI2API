@@ -54,7 +54,7 @@ jobs:
         with:
           name: api-pool-${{ matrix.os }}-${{ matrix.arch }}-${{ steps.set-version.outputs.version }}
           path: api-pool-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.os == 'windows' && '.exe' || '' }}
-          retention-days: 7
+          retention-days: 90
 
   build-wo2api:
     name: Build wo2api
@@ -100,7 +100,7 @@ jobs:
         with:
           name: wo2api-${{ matrix.os }}-${{ matrix.arch }}-${{ steps.set-version.outputs.version }}
           path: wo2api-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.os == 'windows' && '.exe' || '' }}
-          retention-days: 7
+          retention-days: 90
 
   build-hunyuan2api:
     name: Build hunyuan2api
@@ -146,4 +146,4 @@ jobs:
         with:
           name: hunyuan2api-${{ matrix.os }}-${{ matrix.arch }}-${{ steps.set-version.outputs.version }}
           path: hunyuan2api-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.os == 'windows' && '.exe' || '' }}
-          retention-days: 7
+          retention-days: 90
