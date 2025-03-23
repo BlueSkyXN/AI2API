@@ -20,17 +20,157 @@ import (
 	"time"
 )
 
+// WorkerPool 工作池结构体，用于管理goroutine
+type WorkerPool struct {
+	taskQueue       chan *Task
+	workerCount     int
+	shutdownChannel chan struct{}
+	wg              sync.WaitGroup
+}
+
+// Task 任务结构体，包含请求处理所需数据
+type Task struct {
+	r         *http.Request
+	w         http.ResponseWriter
+	done      chan struct{}
+	reqID     string
+	isStream  bool
+	hunyuanReq HunyuanRequest
+}
+
+// NewWorkerPool 创建并启动一个新的工作池
+func NewWorkerPool(workerCount int, queueSize int) *WorkerPool {
+	pool := &WorkerPool{
+		taskQueue:       make(chan *Task, queueSize),
+		workerCount:     workerCount,
+		shutdownChannel: make(chan struct{}),
+	}
+	
+	pool.Start()
+	return pool
+}
+
+// Start 启动工作池中的worker goroutines
+func (pool *WorkerPool) Start() {
+	// 启动工作goroutine
+	for i := 0; i < pool.workerCount; i++ {
+		pool.wg.Add(1)
+		go func(workerID int) {
+			defer pool.wg.Done()
+			
+			logInfo("Worker %d 已启动", workerID)
+			
+			for {
+				select {
+				case task, ok := <-pool.taskQueue:
+					if !ok {
+						// 队列已关闭，退出worker
+						logInfo("Worker %d 收到队列关闭信号，准备退出", workerID)
+						return
+					}
+					
+					logDebug("Worker %d 处理任务 reqID:%s", workerID, task.reqID)
+					
+					// 处理任务
+					if task.isStream {
+						err := handleStreamingRequest(task.w, task.r, task.hunyuanReq, task.reqID)
+						if err != nil {
+							logError("Worker %d 处理流式任务失败: %v", workerID, err)
+						}
+					} else {
+						err := handleNonStreamingRequest(task.w, task.r, task.hunyuanReq, task.reqID)
+						if err != nil {
+							logError("Worker %d 处理非流式任务失败: %v", workerID, err)
+						}
+					}
+					
+					// 通知任务完成
+					close(task.done)
+					
+				case <-pool.shutdownChannel:
+					// 收到关闭信号，退出worker
+					logInfo("Worker %d 收到关闭信号，准备退出", workerID)
+					return
+				}
+			}
+		}(i)
+	}
+}
+
+// SubmitTask 提交任务到工作池，非阻塞
+func (pool *WorkerPool) SubmitTask(task *Task) (bool, error) {
+	select {
+	case pool.taskQueue <- task:
+		// 任务成功添加到队列
+		return true, nil
+	default:
+		// 队列已满
+		return false, fmt.Errorf("任务队列已满")
+	}
+}
+
+// Shutdown 关闭工作池
+func (pool *WorkerPool) Shutdown() {
+	logInfo("正在关闭工作池...")
+	
+	// 发送关闭信号给所有worker
+	close(pool.shutdownChannel)
+	
+	// 等待所有worker退出
+	pool.wg.Wait()
+	
+	// 关闭任务队列
+	close(pool.taskQueue)
+	
+	logInfo("工作池已关闭")
+}
+
+// Semaphore 信号量实现，用于限制并发数量
+type Semaphore struct {
+	sem chan struct{}
+}
+
+// NewSemaphore 创建新的信号量
+func NewSemaphore(size int) *Semaphore {
+	return &Semaphore{
+		sem: make(chan struct{}, size),
+	}
+}
+
+// Acquire 获取信号量（阻塞）
+func (s *Semaphore) Acquire() {
+	s.sem <- struct{}{}
+}
+
+// Release 释放信号量
+func (s *Semaphore) Release() {
+	<-s.sem
+}
+
+// TryAcquire 尝试获取信号量（非阻塞）
+func (s *Semaphore) TryAcquire() bool {
+	select {
+	case s.sem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
 // 配置结构体用于存储命令行参数
 type Config struct {
-	Port         string // 代理服务器监听端口
-	Address      string // 代理服务器监听地址
-	LogLevel     string // 日志级别
-	DevMode      bool   // 开发模式标志
-	MaxRetries   int    // 最大重试次数
-	Timeout      int    // 请求超时时间(秒)
-	VerifySSL    bool   // 是否验证SSL证书
-	ModelName    string // 默认模型名称
-	BearerToken  string // Bearer Token (默认提供公开Token)
+	Port             string // 代理服务器监听端口
+	Address          string // 代理服务器监听地址
+	LogLevel         string // 日志级别
+	DevMode          bool   // 开发模式标志
+	MaxRetries       int    // 最大重试次数
+	Timeout          int    // 请求超时时间(秒)
+	VerifySSL        bool   // 是否验证SSL证书
+	ModelName        string // 默认模型名称
+	BearerToken      string // Bearer Token (默认提供公开Token)
+	WorkerCount      int    // 工作池中的worker数量
+	QueueSize        int    // 任务队列大小
+	MaxConcurrent    int    // 最大并发请求数
 }
 
 // 支持的模型列表
@@ -65,6 +205,9 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.VerifySSL, "verify-ssl", true, "Verify SSL certificates")
 	flag.StringVar(&cfg.ModelName, "model", "hunyuan-t1-latest", "Default Hunyuan model name")
 	flag.StringVar(&cfg.BearerToken, "token", "7auGXNATFSKl7dF", "Bearer token for Hunyuan API")
+	flag.IntVar(&cfg.WorkerCount, "workers", 50, "Number of worker goroutines in the pool")
+	flag.IntVar(&cfg.QueueSize, "queue-size", 500, "Size of the task queue")
+	flag.IntVar(&cfg.MaxConcurrent, "max-concurrent", 100, "Maximum number of concurrent requests")
 	flag.Parse()
 	
 	// 如果开发模式开启，自动设置日志级别为debug
@@ -88,6 +231,14 @@ var (
 	errorCounter      int64
 	avgResponseTime   int64
 	latencyHistogram  [10]int64 // 0-100ms, 100-200ms, ... >1s
+	queuedRequests    int64     // 当前在队列中的请求数
+	rejectedRequests  int64     // 被拒绝的请求数
+)
+
+// 并发控制组件
+var (
+	workerPool     *WorkerPool // 工作池
+	requestSem     *Semaphore  // 请求信号量
 )
 
 // 日志记录器
@@ -240,8 +391,15 @@ func main() {
 	// 初始化日志
 	initLogger(appConfig.LogLevel)
 
-	logInfo("启动服务: TargetURL=%s, Address=%s, Port=%s, Version=%s, LogLevel=%s, 支持模型=%v, BearerToken=***",
-		TargetURL, appConfig.Address, appConfig.Port, Version, appConfig.LogLevel, SupportedModels)
+	logInfo("启动服务: TargetURL=%s, Address=%s, Port=%s, Version=%s, LogLevel=%s, 支持模型=%v, BearerToken=***, WorkerCount=%d, QueueSize=%d, MaxConcurrent=%d",
+		TargetURL, appConfig.Address, appConfig.Port, Version, appConfig.LogLevel, SupportedModels, 
+		appConfig.WorkerCount, appConfig.QueueSize, appConfig.MaxConcurrent)
+
+	// 创建工作池和信号量
+	workerPool = NewWorkerPool(appConfig.WorkerCount, appConfig.QueueSize)
+	requestSem = NewSemaphore(appConfig.MaxConcurrent)
+	
+	logInfo("工作池已创建: %d个worker, 队列大小为%d", appConfig.WorkerCount, appConfig.QueueSize)
 
 	// 配置更高的并发处理能力
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 100
@@ -274,21 +432,6 @@ func main() {
 			return
 		}
 		
-		// 设置超时上下文
-		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(appConfig.Timeout)*time.Second)
-		defer cancel()
-		
-		// 包含超时上下文的请求
-		r = r.WithContext(ctx)
-		
-		// 添加恢复机制，防止panic
-		defer func() {
-			if r := recover(); r != nil {
-				logError("处理请求时发生panic: %v", r)
-				http.Error(w, "Internal server error", http.StatusInternalServerError)
-			}
-		}()
-		
 		// 计数器增加
 		countMutex.Lock()
 		requestCount++
@@ -300,8 +443,21 @@ func main() {
 		// 请求计数
 		atomic.AddInt64(&requestCounter, 1)
 		
+		// 尝试获取信号量
+		if !requestSem.TryAcquire() {
+			// 请求数量超过限制
+			atomic.AddInt64(&rejectedRequests, 1)
+			logWarn("请求 #%d 被拒绝: 当前并发请求数已达上限", currentCount)
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, "Server is busy, please try again later", http.StatusServiceUnavailable)
+			return
+		}
+		
+		// 释放信号量（在函数返回时）
+		defer requestSem.Release()
+		
 		// 处理请求
-		handleChatCompletionRequest(w, r)
+		handleChatCompletionRequestWithPool(w, r, currentCount)
 	})
 	
 	// 添加健康检查端点
@@ -312,13 +468,46 @@ func main() {
 			return
 		}
 		
-		countMutex.Lock()
-		count := requestCount
-		countMutex.Unlock()
+		// 获取各种计数器的值
+		reqCount := atomic.LoadInt64(&requestCounter)
+		succCount := atomic.LoadInt64(&successCounter)
+		errCount := atomic.LoadInt64(&errorCounter)
+		queuedCount := atomic.LoadInt64(&queuedRequests)
+		rejectedCount := atomic.LoadInt64(&rejectedRequests)
+		
+		// 计算平均响应时间
+		var avgTime int64 = 0
+		if reqCount > 0 {
+			avgTime = atomic.LoadInt64(&avgResponseTime) / max(reqCount, 1)
+		}
+		
+		// 构建延迟直方图数据
+		histogram := make([]int64, 10)
+		for i := 0; i < 10; i++ {
+			histogram[i] = atomic.LoadInt64(&latencyHistogram[i])
+		}
+		
+		// 构建响应
+		stats := map[string]interface{}{
+			"status":           "ok",
+			"version":          Version,
+			"requests":         reqCount,
+			"success":          succCount,
+			"errors":           errCount,
+			"queued":           queuedCount,
+			"rejected":         rejectedCount,
+			"avg_time_ms":      avgTime,
+			"histogram_ms":     histogram,
+			"worker_count":     workerPool.workerCount,
+			"queue_size":       len(workerPool.taskQueue),
+			"queue_capacity":   cap(workerPool.taskQueue),
+			"queue_percent":    float64(len(workerPool.taskQueue)) / float64(cap(workerPool.taskQueue)) * 100,
+			"concurrent_limit": appConfig.MaxConcurrent,
+		}
 		
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(fmt.Sprintf(`{"status":"ok","version":"%s","requests":%d}`, Version, count)))
+		json.NewEncoder(w).Encode(stats)
 	})
 	
 	// 创建停止通道
@@ -346,6 +535,9 @@ func main() {
 	if err := server.Shutdown(ctx); err != nil {
 		logError("Server shutdown failed: %v", err)
 	}
+	
+	// 关闭工作池
+	workerPool.Shutdown()
 	
 	logInfo("Server gracefully stopped")
 }
@@ -463,7 +655,125 @@ func handleModelsRequest(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(modelsList)
 }
 
-// 处理聊天补全请求
+// 处理聊天补全请求（使用工作池）
+func handleChatCompletionRequestWithPool(w http.ResponseWriter, r *http.Request, requestNum uint64) {
+	reqID := generateRequestID()
+	startTime := time.Now()
+	logInfo("[reqID:%s] 处理聊天补全请求 #%d", reqID, requestNum)
+
+	// 设置超时上下文
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(appConfig.Timeout)*time.Second)
+	defer cancel()
+	
+	// 包含超时上下文的请求
+	r = r.WithContext(ctx)
+	
+	// 添加恢复机制，防止panic
+	defer func() {
+		if r := recover(); r != nil {
+			logError("[reqID:%s] 处理请求时发生panic: %v", reqID, r)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		}
+	}()
+
+	// 解析请求体
+	var apiReq APIRequest
+	if err := json.NewDecoder(r.Body).Decode(&apiReq); err != nil {
+		logError("[reqID:%s] 解析请求失败: %v", reqID, err)
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// 验证消息格式
+	valid, errMsg := validateMessages(apiReq.Messages)
+	if !valid {
+		logError("[reqID:%s] 消息格式验证失败: %s", reqID, errMsg)
+		http.Error(w, errMsg, http.StatusBadRequest)
+		return
+	}
+
+	// 是否使用流式处理
+	isStream := apiReq.Stream
+
+	// 确定使用的模型
+	modelName := appConfig.ModelName
+	if apiReq.Model != "" {
+		// 检查请求的模型是否是我们支持的
+		if isModelSupported(apiReq.Model) {
+			modelName = apiReq.Model
+		} else {
+			logWarn("[reqID:%s] 请求的模型 %s 不支持，使用默认模型 %s", reqID, apiReq.Model, modelName)
+		}
+	}
+	
+	logInfo("[reqID:%s] 使用模型: %s", reqID, modelName)
+
+	// 创建混元API请求
+	hunyuanReq := HunyuanRequest{
+		Stream:            true, // 混元API总是使用流式响应
+		Model:             modelName,
+		QueryID:           generateQueryID(),
+		Messages:          apiReq.Messages,
+		StreamModeration:  true,
+		EnableEnhancement: false,
+	}
+	
+	// 创建任务
+	task := &Task{
+		r:          r,
+		w:          w,
+		done:       make(chan struct{}),
+		reqID:      reqID,
+		isStream:   isStream,
+		hunyuanReq: hunyuanReq,
+	}
+	
+	// 添加到任务队列
+	atomic.AddInt64(&queuedRequests, 1)
+	submitted, err := workerPool.SubmitTask(task)
+	if !submitted {
+		atomic.AddInt64(&queuedRequests, -1)
+		atomic.AddInt64(&rejectedRequests, 1)
+		logError("[reqID:%s] 提交任务失败: %v", reqID, err)
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "Server queue is full, please try again later", http.StatusServiceUnavailable)
+		return
+	}
+	
+	logInfo("[reqID:%s] 任务已提交到队列", reqID)
+	
+	// 等待任务完成或超时
+	select {
+	case <-task.done:
+		// 任务已完成
+		logInfo("[reqID:%s] 任务已完成", reqID)
+	case <-r.Context().Done():
+		// 请求被取消或超时
+		logWarn("[reqID:%s] 请求被取消或超时", reqID)
+		// 注意：虽然请求被取消，但worker可能仍在处理任务
+	}
+	
+	// 请求处理完成，更新指标
+	atomic.AddInt64(&queuedRequests, -1)
+	elapsed := time.Since(startTime).Milliseconds()
+	
+	// 更新延迟直方图
+	bucketIndex := min(int(elapsed/100), 9)
+	atomic.AddInt64(&latencyHistogram[bucketIndex], 1)
+	
+	// 更新平均响应时间
+	atomic.AddInt64(&avgResponseTime, elapsed)
+	
+	if r.Context().Err() == nil {
+		// 成功计数增加
+		atomic.AddInt64(&successCounter, 1)
+		logInfo("[reqID:%s] 请求处理成功，耗时: %dms", reqID, elapsed)
+	} else {
+		logError("[reqID:%s] 请求处理失败: %v, 耗时: %dms", reqID, r.Context().Err(), elapsed)
+	}
+}
+
+// 处理聊天补全请求（原实现，已不使用）
 func handleChatCompletionRequest(w http.ResponseWriter, r *http.Request) {
 	reqID := generateRequestID()
 	startTime := time.Now()
