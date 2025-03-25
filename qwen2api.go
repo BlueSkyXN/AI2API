@@ -24,14 +24,16 @@ import (
 	"time"
 )
 
-// 版本和API常量
+// API常量
 const (
-	Version   = "1.0.0"
 	TargetURL = "https://chat.qwen.ai/api/chat/completions"
 	ModelsURL = "https://chat.qwen.ai/api/models"
 	FilesURL  = "https://chat.qwen.ai/api/v1/files/"
 	TasksURL  = "https://chat.qwen.ai/api/v1/tasks/status/"
 )
+
+// Version 当前版本，可以被编译时注入的版本覆盖
+var Version = "1.0.0"
 
 // AppVersion 应用版本，可通过编译时注入
 var AppVersion string
