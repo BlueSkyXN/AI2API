@@ -204,7 +204,7 @@ export default {
     }
   },
 
-  // ---------------------- 流式响应处理（重构并去重） ----------------------
+  // ---------------------- 流式响应处理（改进） ----------------------
   async handleStreamResponse(fetchResponse, requestId, modelName) {
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
@@ -215,8 +215,9 @@ export default {
       await writer.write(encoder.encode(`data: ${payload}\n\n`));
     };
 
-    // 用于去重：记录上一次完整接收到的 delta 内容
+    // 用于去重和累积内容
     let previousDelta = "";
+    let cumulativeContent = ""; // 累积完整内容，解决断流问题
 
     const processStream = async () => {
       try {
@@ -227,67 +228,29 @@ export default {
 
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            // 确保最后一个缓冲区也被处理
+            if (buffer.trim()) {
+              await processBuffer(buffer);
+            }
+            break;
+          }
 
           const chunkStr = decoder.decode(value, { stream: true });
           buffer += chunkStr;
 
-          // SSE 消息通常以 "\n\n" 分隔
-          const parts = buffer.split('\n\n');
-          buffer = parts.pop() || '';
-
-          for (const part of parts) {
-            if (!part.trim()) continue;
-
-            const lines = part.split('\n');
-            for (const line of lines) {
-              if (!line.startsWith('data: ')) continue;
-
-              const dataStr = line.slice('data: '.length).trim();
-              if (dataStr === '[DONE]') {
-                await sendSSE('[DONE]');
-                console.log('收到 [DONE]，流结束');
-                break;
-              }
-
-              try {
-                const jsonData = JSON.parse(dataStr);
-                const delta = jsonData?.choices?.[0]?.delta;
-                if (!delta) continue;
-
-                let currentDelta = delta.content || "";
-                // 去除重复：如果当前内容以上次完整内容为前缀，则只保留新增部分
-                let newContent = currentDelta;
-                if (previousDelta && currentDelta.startsWith(previousDelta)) {
-                  newContent = currentDelta.substring(previousDelta.length);
-                }
-                previousDelta = currentDelta;
-                if (!newContent) continue;
-
-                const openaiChunk = {
-                  id: `chatcmpl-${requestId}`,
-                  object: 'chat.completion.chunk',
-                  created: Date.now(),
-                  model: modelName,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: isFirstChunk
-                        ? { role: 'assistant', content: newContent }
-                        : { content: newContent },
-                      finish_reason: null
-                    }
-                  ]
-                };
-
-                if (isFirstChunk) isFirstChunk = false;
-                await sendSSE(JSON.stringify(openaiChunk));
-              } catch (err) {
-                console.error('解析 SSE JSON 失败:', dataStr, err);
-              }
-            }
+          // 更可靠的处理方式：按照 SSE 规范处理双换行符分隔的消息
+          await processBuffer(buffer);
+          
+          // 仅保留可能不完整的最后一部分
+          const lastBoundaryIndex = buffer.lastIndexOf('\n\n');
+          if (lastBoundaryIndex !== -1) {
+            buffer = buffer.substring(lastBoundaryIndex + 2);
           }
         }
+
+        // 确保发送最终 DONE 信号
+        console.log(`流处理完成，累积内容长度: ${cumulativeContent.length}`);
         await sendSSE('[DONE]');
       } catch (err) {
         console.error('处理 SSE 流时出错:', err);
@@ -305,11 +268,97 @@ export default {
           ]
         };
         try {
-          await writer.write(encoder.encode(`data: ${JSON.stringify(errorChunk)}\n\n`));
-          await writer.write(encoder.encode('data: [DONE]\n\n'));
+          await sendSSE(JSON.stringify(errorChunk));
+          await sendSSE('[DONE]');
         } catch (_) {}
       } finally {
         await writer.close();
+      }
+    };
+
+    // 处理缓冲区内的完整 SSE 消息
+    const processBuffer = async (buffer) => {
+      // 按 data: 行分割
+      const dataLineRegex = /^data: (.+)$/gm;
+      let match;
+      
+      while ((match = dataLineRegex.exec(buffer)) !== null) {
+        const dataStr = match[1].trim();
+        
+        if (dataStr === '[DONE]') {
+          await sendSSE('[DONE]');
+          console.log('收到 [DONE]，流结束');
+          continue;
+        }
+
+        try {
+          const jsonData = JSON.parse(dataStr);
+          const delta = jsonData?.choices?.[0]?.delta;
+          if (!delta) continue;
+
+          let currentDelta = delta.content || "";
+          
+          // 改进的去重逻辑：如果有完整内容，检查是否为前缀
+          if (currentDelta) {
+            let newContent = currentDelta;
+            let needsSending = true;
+            
+            if (previousDelta && currentDelta.startsWith(previousDelta)) {
+              // 只提取新增部分
+              newContent = currentDelta.substring(previousDelta.length);
+              // 如果没有新增内容，跳过发送
+              if (!newContent) needsSending = false;
+            }
+
+            if (needsSending) {
+              // 创建并发送内容块
+              const openaiChunk = {
+                id: `chatcmpl-${requestId}`,
+                object: 'chat.completion.chunk',
+                created: Date.now(),
+                model: modelName,
+                choices: [
+                  {
+                    index: 0,
+                    delta: isFirstChunk
+                      ? { role: 'assistant', content: newContent }
+                      : { content: newContent },
+                    finish_reason: null
+                  }
+                ]
+              };
+
+              if (isFirstChunk) isFirstChunk = false;
+              await sendSSE(JSON.stringify(openaiChunk));
+              
+              // 累积内容
+              cumulativeContent += newContent;
+            }
+
+            // 更新之前的内容为当前完整内容
+            previousDelta = currentDelta;
+          }
+
+          // 处理完成标志
+          if (jsonData?.choices?.[0]?.finish_reason) {
+            const finishChunk = {
+              id: `chatcmpl-${requestId}`,
+              object: 'chat.completion.chunk',
+              created: Date.now(),
+              model: modelName,
+              choices: [
+                {
+                  index: 0,
+                  delta: {},
+                  finish_reason: jsonData.choices[0].finish_reason
+                }
+              ]
+            };
+            await sendSSE(JSON.stringify(finishChunk));
+          }
+        } catch (err) {
+          console.error('解析 SSE JSON 失败:', dataStr, err);
+        }
       }
     };
 
