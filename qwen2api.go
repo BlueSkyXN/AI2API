@@ -1175,11 +1175,8 @@ func handleStreamingRequest(w http.ResponseWriter, r *http.Request, apiReq APIRe
 	w.Write([]byte("data: " + string(roleChunk) + "\n\n"))
 	flusher.Flush()
 
-	// 用于去重的前一个内容
-	previousContent := ""
-
-	// 创建正则表达式来查找 data: 行
-	dataRegex := regexp.MustCompile(`(?m)^data: (.+)$`)
+// 用于去重的前一个内容
+previousContent := ""
 
 // 持续读取响应
 buffer := ""
