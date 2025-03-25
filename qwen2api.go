@@ -25,7 +25,7 @@ import (
 
 // 版本和API常量
 const (
-	Version   = "1.0.0"
+	Version   = "1.0.1" // 升级版本号
 	TargetURL = "https://chat.qwen.ai/api/chat/completions"
 	ModelsURL = "https://chat.qwen.ai/api/models"
 	FilesURL  = "https://chat.qwen.ai/api/v1/files/"
@@ -143,7 +143,7 @@ type QwenRequest struct {
 	Size              string       `json:"size,omitempty"`
 }
 
-// QwenResponse 通义千问API响应结构体
+// QwenResponse 通义千问API响应结构体 - 更新以匹配实际API响应
 type QwenResponse struct {
 	Messages []struct {
 		Role    string `json:"role"`
@@ -165,6 +165,10 @@ type QwenResponse struct {
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
+	Error struct {
+		Message string `json:"message"`
+		Code    string `json:"code"`
+	} `json:"error"`
 }
 
 // FileUploadResponse 文件上传响应
@@ -499,6 +503,74 @@ func getHTTPClient() *http.Client {
 		Timeout:   time.Duration(appConfig.Timeout) * time.Second,
 		Transport: tr,
 	}
+}
+
+// 请求API的可重试包装函数
+func makeAPIRequestWithRetry(ctx context.Context, method, url, authToken string, body []byte, maxRetries int) (*http.Response, error) {
+    client := getHTTPClient()
+    var resp *http.Response
+    var err error
+    
+    for attempt := 0; attempt <= maxRetries; attempt++ {
+        if attempt > 0 {
+            logInfo("第%d次重试API请求", attempt)
+            time.Sleep(time.Duration(attempt) * 500 * time.Millisecond) // 指数退避
+        }
+        
+        req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBuffer(body))
+        if err != nil {
+            continue
+        }
+        
+        // 设置请求头
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("Authorization", "Bearer "+authToken)
+        req.Header.Set("User-Agent", "Mozilla/5.0")
+        
+        resp, err = client.Do(req)
+        if err == nil && resp.StatusCode == http.StatusOK {
+            return resp, nil
+        }
+        
+        // 关闭响应体，防止连接泄漏
+        if resp != nil && resp.Body != nil {
+            resp.Body.Close()
+        }
+    }
+    
+    return nil, fmt.Errorf("API请求失败，已重试%d次: %v", maxRetries, err)
+}
+
+// 处理API错误的通用函数
+func handleAPIError(w http.ResponseWriter, reqID string, statusCode int, body []byte) {
+    logError("[reqID:%s] API返回错误，状态码: %d", reqID, statusCode)
+    
+    // 尝试解析错误响应
+    var errorResp struct {
+        Error struct {
+            Message string `json:"message"`
+            Code    string `json:"code"`
+        } `json:"error"`
+    }
+    
+    errorMessage := "未知API错误"
+    if err := json.Unmarshal(body, &errorResp); err == nil && errorResp.Error.Message != "" {
+        errorMessage = errorResp.Error.Message
+        logError("[reqID:%s] API错误信息: %s (代码: %s)", reqID, errorResp.Error.Message, errorResp.Error.Code)
+    } else {
+        // 记录原始响应体以便调试
+        logError("[reqID:%s] API错误原始响应: %s", reqID, string(body))
+    }
+    
+    http.Error(w, fmt.Sprintf("API错误: %s", errorMessage), statusCode)
+}
+
+// 截断字符串函数，用于日志显示
+func truncateString(s string, maxLen int) string {
+    if len(s) <= maxLen {
+        return s
+    }
+    return s[:maxLen] + "..."
 }
 
 // 主入口函数
@@ -847,6 +919,29 @@ func main() {
 		json.NewEncoder(w).Encode(stats)
 	})
 	
+	// 添加日志级别动态调整端点
+	http.HandleFunc("/debug/log-level", func(w http.ResponseWriter, r *http.Request) {
+		setCORSHeaders(w)
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		// 获取请求的日志级别
+		level := r.URL.Query().Get("level")
+		if level != "" && (level == LogLevelDebug || level == LogLevelInfo || level == LogLevelWarn || level == LogLevelError) {
+			oldLevel := logLevel
+			logLevel = level
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "Log level changed from %s to %s", oldLevel, logLevel)
+			logInfo("日志级别已更改为: %s", logLevel)
+			return
+		}
+		
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Current log level: %s", logLevel)
+	})
+	
 	// 创建停止通道
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -1001,291 +1096,343 @@ func returnDefaultModels(w http.ResponseWriter) {
 	json.NewEncoder(w).Encode(modelsResp)
 }
 
-// 处理聊天完成请求（流式）
+// 创建错误响应块
+func createErrorChunk(id string, created int64, model string, errorMsg string) []byte {
+    errorReason := "error"
+    chunk := StreamChunk{
+        ID:      id,
+        Object:  "chat.completion.chunk",
+        Created: created,
+        Model:   model,
+        Choices: []struct {
+            Index        int     `json:"index"`
+            Delta        struct {
+                Role    string `json:"role,omitempty"`
+                Content string `json:"content,omitempty"`
+            } `json:"delta"`
+            FinishReason *string `json:"finish_reason,omitempty"`
+        }{
+            {
+                Index: 0,
+                Delta: struct {
+                    Role    string `json:"role,omitempty"`
+                    Content string `json:"content,omitempty"`
+                }{
+                    Content: "【流式处理出错，请重试】",
+                },
+                FinishReason: &errorReason,
+            },
+        },
+    }
+
+    data, _ := json.Marshal(chunk)
+    return data
+}
+
+// 处理聊天完成请求（流式）- 重写版本
 func handleStreamingRequest(w http.ResponseWriter, r *http.Request, apiReq APIRequest, reqID string) {
-	logInfo("[reqID:%s] 处理流式请求", reqID)
+    logInfo("[reqID:%s] 处理流式请求", reqID)
 
-	// 从请求中提取token
-	authToken, err := extractToken(r)
-	if err != nil {
-		logError("[reqID:%s] 提取token失败: %v", reqID, err)
-		http.Error(w, "无效的认证信息", http.StatusUnauthorized)
-		return
-	}
+    // 从请求中提取token
+    authToken, err := extractToken(r)
+    if err != nil {
+        logError("[reqID:%s] 提取token失败: %v", reqID, err)
+        http.Error(w, "无效的认证信息", http.StatusUnauthorized)
+        return
+    }
 
-	// 检查消息
-	if len(apiReq.Messages) == 0 {
-		logError("[reqID:%s] 消息为空", reqID)
-		http.Error(w, "消息为空", http.StatusBadRequest)
-		return
-	}
+    // 检查消息
+    if len(apiReq.Messages) == 0 {
+        logError("[reqID:%s] 消息为空", reqID)
+        http.Error(w, "消息为空", http.StatusBadRequest)
+        return
+    }
 
-	// 准备模型名和聊天类型
-	modelName := "qwen-turbo-latest"
-	if apiReq.Model != "" {
-		modelName = apiReq.Model
-	}
-	chatType := "t2t"
+    // 准备模型名和聊天类型
+    modelName := "qwen-turbo-latest"
+    if apiReq.Model != "" {
+        modelName = apiReq.Model
+    }
+    chatType := "t2t"
 
-	// 处理特殊模型名后缀
-	if strings.Contains(modelName, "-draw") {
-		handleDrawRequest(w, r, apiReq, reqID, authToken)
-		return
-	}
+    // 处理特殊模型名后缀
+    if strings.Contains(modelName, "-draw") {
+        handleDrawRequest(w, r, apiReq, reqID, authToken)
+        return
+    }
 
-	// 处理思考模式
-	if strings.Contains(modelName, "-thinking") {
-		modelName = strings.Replace(modelName, "-thinking", "", 1)
-		lastMsgIdx := len(apiReq.Messages) - 1
-		if lastMsgIdx >= 0 {
-			apiReq.Messages[lastMsgIdx].FeatureConfig = map[string]interface{}{
-				"thinking_enabled": true,
-			}
-		}
-	}
+    // 处理思考模式
+    if strings.Contains(modelName, "-thinking") {
+        modelName = strings.Replace(modelName, "-thinking", "", 1)
+        lastMsgIdx := len(apiReq.Messages) - 1
+        if lastMsgIdx >= 0 {
+            apiReq.Messages[lastMsgIdx].FeatureConfig = map[string]interface{}{
+                "thinking_enabled": true,
+            }
+        }
+    }
 
-	// 处理搜索模式
-	if strings.Contains(modelName, "-search") {
-		modelName = strings.Replace(modelName, "-search", "", 1)
-		chatType = "search"
-		lastMsgIdx := len(apiReq.Messages) - 1
-		if lastMsgIdx >= 0 {
-			apiReq.Messages[lastMsgIdx].ChatType = "search"
-		}
-	}
+    // 处理搜索模式
+    if strings.Contains(modelName, "-search") {
+        modelName = strings.Replace(modelName, "-search", "", 1)
+        chatType = "search"
+        lastMsgIdx := len(apiReq.Messages) - 1
+        if lastMsgIdx >= 0 {
+            apiReq.Messages[lastMsgIdx].ChatType = "search"
+        }
+    }
 
-	// 处理图片消息
-	lastMsgIdx := len(apiReq.Messages) - 1
-	if lastMsgIdx >= 0 {
-		lastMsg := apiReq.Messages[lastMsgIdx]
-		
-		// 检查内容是否为数组
-		contentArray, ok := lastMsg.Content.([]interface{})
-		if ok {
-			// 处理内容数组
-			for i, item := range contentArray {
-				itemMap, isMap := item.(map[string]interface{})
-				if !isMap {
-					continue
-				}
+    // 处理图片消息
+    lastMsgIdx := len(apiReq.Messages) - 1
+    if lastMsgIdx >= 0 {
+        lastMsg := apiReq.Messages[lastMsgIdx]
+        
+        // 检查内容是否为数组
+        contentArray, ok := lastMsg.Content.([]interface{})
+        if ok {
+            // 处理内容数组
+            for i, item := range contentArray {
+                itemMap, isMap := item.(map[string]interface{})
+                if !isMap {
+                    continue
+                }
 
-				// 检查是否包含图像URL
-				if imageURL, hasImageURL := itemMap["image_url"]; hasImageURL {
-					imageURLMap, isMap := imageURL.(map[string]interface{})
-					if !isMap {
-						continue
-					}
+                // 检查是否包含图像URL
+                if imageURL, hasImageURL := itemMap["image_url"]; hasImageURL {
+                    imageURLMap, isMap := imageURL.(map[string]interface{})
+                    if !isMap {
+                        continue
+                    }
 
-					// 获取URL
-					url, hasURL := imageURLMap["url"].(string)
-					if !hasURL {
-						continue
-					}
+                    // 获取URL
+                    url, hasURL := imageURLMap["url"].(string)
+                    if !hasURL {
+                        continue
+                    }
 
-					// 上传图像
-					imageID, uploadErr := uploadImage(url, authToken)
-					if uploadErr != nil {
-						logError("[reqID:%s] 上传图像失败: %v", reqID, uploadErr)
-						continue
-					}
+                    // 上传图像
+                    imageID, uploadErr := uploadImage(url, authToken)
+                    if uploadErr != nil {
+                        logError("[reqID:%s] 上传图像失败: %v", reqID, uploadErr)
+                        continue
+                    }
 
-					// 替换内容
-					contentArrayCopy := make([]interface{}, len(contentArray))
-					copy(contentArrayCopy, contentArray)
-					contentArrayCopy[i] = map[string]interface{}{
-						"type":  "image",
-						"image": imageID,
-					}
-					apiReq.Messages[lastMsgIdx].Content = contentArrayCopy
-					break
-				}
-			}
-		}
-	}
+                    // 替换内容
+                    contentArrayCopy := make([]interface{}, len(contentArray))
+                    copy(contentArrayCopy, contentArray)
+                    contentArrayCopy[i] = map[string]interface{}{
+                        "type":  "image",
+                        "image": imageID,
+                    }
+                    apiReq.Messages[lastMsgIdx].Content = contentArrayCopy
+                    break
+                }
+            }
+        }
+    }
 
-	// 创建通义千问请求
-	qwenReq := QwenRequest{
-		Model:    modelName,
-		Messages: apiReq.Messages,
-		Stream:   true,
-		ChatType: chatType,
-		ID:       generateUUID(),
-	}
+    // 创建通义千问请求
+    qwenReq := QwenRequest{
+        Model:    modelName,
+        Messages: apiReq.Messages,
+        Stream:   true,
+        ChatType: chatType,
+        ID:       generateUUID(),
+    }
 
-	// 序列化请求
-	reqData, err := json.Marshal(qwenReq)
-	if err != nil {
-		logError("[reqID:%s] 序列化请求失败: %v", reqID, err)
-		http.Error(w, "内部服务器错误", http.StatusInternalServerError)
-		return
-	}
+    // 序列化请求
+    reqData, err := json.Marshal(qwenReq)
+    if err != nil {
+        logError("[reqID:%s] 序列化请求失败: %v", reqID, err)
+        http.Error(w, "内部服务器错误", http.StatusInternalServerError)
+        return
+    }
 
-	// 创建HTTP请求
-	req, err := http.NewRequestWithContext(r.Context(), "POST", TargetURL, bytes.NewBuffer(reqData))
-	if err != nil {
-		logError("[reqID:%s] 创建请求失败: %v", reqID, err)
-		http.Error(w, "内部服务器错误", http.StatusInternalServerError)
-		return
-	}
+    // 创建HTTP请求并设置超时
+    resp, err := makeAPIRequestWithRetry(r.Context(), "POST", TargetURL, authToken, reqData, appConfig.MaxRetries)
+    if err != nil {
+        logError("[reqID:%s] 发送请求失败: %v", reqID, err)
+        http.Error(w, "连接到API失败", http.StatusBadGateway)
+        return
+    }
+    defer resp.Body.Close()
 
-	// 设置请求头
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+authToken)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+    // 检查响应状态
+    if resp.StatusCode != http.StatusOK {
+        bodyBytes, _ := io.ReadAll(resp.Body)
+        logError("[reqID:%s] API返回非200状态码: %d, 响应: %s", reqID, resp.StatusCode, string(bodyBytes))
+        http.Error(w, fmt.Sprintf("API错误，状态码: %d", resp.StatusCode), resp.StatusCode)
+        return
+    }
 
-	// 发送请求
-	client := getHTTPClient()
-	resp, err := client.Do(req)
-	if err != nil {
-		logError("[reqID:%s] 发送请求失败: %v", reqID, err)
-		http.Error(w, "连接到API失败", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
+    // 设置响应头
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("Connection", "keep-alive")
+    w.Header().Set("X-Accel-Buffering", "no") // 禁用Nginx缓冲
 
-	// 检查响应状态
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		logError("[reqID:%s] API返回非200状态码: %d, 响应: %s", reqID, resp.StatusCode, string(bodyBytes))
-		http.Error(w, fmt.Sprintf("API错误，状态码: %d", resp.StatusCode), resp.StatusCode)
-		return
-	}
+    // 创建响应ID和时间戳
+    respID := fmt.Sprintf("chatcmpl-%s", generateUUID())
+    createdTime := time.Now().Unix()
 
-	// 设置响应头
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+    // 创建读取器和Flusher
+    reader := bufio.NewReaderSize(resp.Body, 16384)
+    flusher, ok := w.(http.Flusher)
+    if !ok {
+        logError("[reqID:%s] 流式传输不支持", reqID)
+        http.Error(w, "流式传输不支持", http.StatusInternalServerError)
+        return
+    }
 
-	// 创建响应ID和时间戳
-	respID := fmt.Sprintf("chatcmpl-%s", generateUUID())
-	createdTime := time.Now().Unix()
+    // 发送角色块
+    roleChunk := createRoleChunk(respID, createdTime, modelName)
+    if _, err := w.Write([]byte("data: " + string(roleChunk) + "\n\n")); err != nil {
+        logError("[reqID:%s] 写入角色块失败: %v", reqID, err)
+        return
+    }
+    flusher.Flush()
+    logDebug("[reqID:%s] 已发送角色块", reqID)
 
-	// 创建读取器和Flusher
-	reader := bufio.NewReaderSize(resp.Body, 16384)
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		logError("[reqID:%s] 流式传输不支持", reqID)
-		http.Error(w, "流式传输不支持", http.StatusInternalServerError)
-		return
-	}
+    // 用于去重和累积的变量
+    previousContent := ""
+    accumulatedContent := ""
+    buffer := ""
 
-	// 发送角色块
-	roleChunk := createRoleChunk(respID, createdTime, modelName)
-	w.Write([]byte("data: " + string(roleChunk) + "\n\n"))
-	flusher.Flush()
+    // 持续读取响应
+    for {
+        // 添加超时检测
+        select {
+        case <-r.Context().Done():
+            logWarn("[reqID:%s] 请求超时或被客户端取消", reqID)
+            return
+        default:
+            // 继续处理
+        }
 
-// 用于去重的前一个内容
-previousContent := ""
+        // 读取一块数据
+        chunk := make([]byte, 4096)
+        n, err := reader.Read(chunk)
+        if err != nil {
+            if err != io.EOF {
+                logError("[reqID:%s] 读取响应出错: %v", reqID, err)
+                
+                // 发送错误通知给客户端
+                errorChunk := createErrorChunk(respID, createdTime, modelName, "读取响应出错")
+                w.Write([]byte("data: " + string(errorChunk) + "\n\n"))
+                w.Write([]byte("data: [DONE]\n\n"))
+                flusher.Flush()
+                return
+            }
+            break
+        }
 
-// 持续读取响应
-buffer := ""
-pendingContent := ""  // 用于累积内容，解决流处理断开问题
-for {
-// 添加超时检测
-select {
-case <-r.Context().Done():
-logWarn("[reqID:%s] 请求超时或被客户端取消", reqID)
-return
-default:
-// 继续处理
-}
+        // 添加到缓冲区并记录原始数据以便调试
+        newData := string(chunk[:n])
+        buffer += newData
+        logDebug("[reqID:%s] 收到原始数据(%d字节): %s", reqID, n, truncateString(newData, 100))
 
-// 读取一块数据
-chunk := make([]byte, 4096)
-n, err := reader.Read(chunk)
-if err != nil {
-if err != io.EOF {
-logError("[reqID:%s] 读取响应出错: %v", reqID, err)
-return
-}
-break
-}
+        // 按照SSE消息格式处理缓冲区 - 使用双换行符分割
+        messages := strings.Split(buffer, "\n\n")
+        
+        // 保留最后一个可能不完整的消息
+        if len(messages) > 0 {
+            buffer = messages[len(messages)-1]
+            // 处理所有完整的消息
+            for i := 0; i < len(messages)-1; i++ {
+                message := messages[i]
+                if !strings.HasPrefix(message, "data: ") {
+                    continue
+                }
 
-// 添加到缓冲区
-buffer += string(chunk[:n])
+                // 提取数据部分
+                dataStr := strings.TrimPrefix(message, "data: ")
+                dataStr = strings.TrimSpace(dataStr)
 
-// 更稳健的处理方式：按行分割并只处理完整行
-lines := strings.Split(buffer, "\n")
-// 保留最后可能不完整的行
-if len(lines) > 0 {
-buffer = lines[len(lines)-1]
-}
+                // 处理[DONE]消息
+                if dataStr == "[DONE]" {
+                    logInfo("[reqID:%s] 收到[DONE]消息", reqID)
+                    w.Write([]byte("data: [DONE]\n\n"))
+                    flusher.Flush()
+                    continue
+                }
 
-// 处理所有完整的行（除最后一行外）
-for i := 0; i < len(lines)-1; i++ {
-line := lines[i]
-if !strings.HasPrefix(line, "data: ") {
-continue
-}
+                // 解析JSON，记录原始数据以便调试
+                logDebug("[reqID:%s] 解析JSON数据: %s", reqID, truncateString(dataStr, 100))
+                var qwenResp QwenResponse
+                if err := json.Unmarshal([]byte(dataStr), &qwenResp); err != nil {
+                    logWarn("[reqID:%s] 解析JSON失败: %v, data: %s", reqID, err, truncateString(dataStr, 100))
+                    continue
+                }
 
-// 提取数据部分
-dataStr := strings.TrimPrefix(line, "data: ")
+                // 处理响应数据
+                hasContent := false
+                for _, choice := range qwenResp.Choices {
+                    content := choice.Delta.Content
+                    if content == "" {
+                        continue
+                    }
+                    
+                    hasContent = true
+                    logDebug("[reqID:%s] 收到内容: %s", reqID, truncateString(content, 50))
 
-// 处理[DONE]消息
-if dataStr == "[DONE]" {
-logDebug("[reqID:%s] 收到[DONE]消息", reqID)
-w.Write([]byte("data: [DONE]\n\n"))
-flusher.Flush()
-continue
-}
+                    // 改进去重逻辑
+                    var newContent string
+                    if previousContent != "" && strings.HasPrefix(content, previousContent) {
+                        // 提取新增部分
+                        newContent = content[len(previousContent):]
+                        if newContent == "" {
+                            logDebug("[reqID:%s] 内容重复，跳过", reqID)
+                            continue
+                        }
+                        logDebug("[reqID:%s] 去重后新增内容: %s", reqID, truncateString(newContent, 50))
+                    } else {
+                        // 使用完整内容
+                        newContent = content
+                    }
 
-// 解析JSON
-var qwenResp QwenResponse
-if err := json.Unmarshal([]byte(dataStr), &qwenResp); err != nil {
-logWarn("[reqID:%s] 解析JSON失败: %v, data: %s", reqID, err, dataStr)
-continue
-}
+                    // 创建内容块并发送
+                    contentChunk := createContentChunk(respID, createdTime, modelName, newContent)
+                    if _, err := w.Write([]byte("data: " + string(contentChunk) + "\n\n")); err != nil {
+                        logError("[reqID:%s] 写入内容块失败: %v", reqID, err)
+                        return
+                    }
+                    flusher.Flush()
+                    
+                    // 更新前一个内容和累积内容
+                    previousContent = content
+                    accumulatedContent += newContent
+                }
 
-// 处理块
-for _, choice := range qwenResp.Choices {
-content := choice.Delta.Content
+                // 处理完成标志
+                for _, choice := range qwenResp.Choices {
+                    if choice.FinishReason != "" {
+                        finishReason := choice.FinishReason
+                        logInfo("[reqID:%s] 收到完成标志: %s", reqID, finishReason)
+                        doneChunk := createDoneChunk(respID, createdTime, modelName, finishReason)
+                        if _, err := w.Write([]byte("data: " + string(doneChunk) + "\n\n")); err != nil {
+                            logError("[reqID:%s] 写入完成块失败: %v", reqID, err)
+                            return
+                        }
+                        flusher.Flush()
+                    }
+                }
+                
+                // 调试日志：记录是否有内容
+                if !hasContent {
+                    logDebug("[reqID:%s] 该消息没有内容", reqID)
+                }
+            }
+        }
+    }
 
-// 改进去重逻辑 - 只处理重复前缀
-if previousContent != "" && strings.HasPrefix(content, previousContent) {
-// 计算新增内容
-newContent := content[len(previousContent):]
-if newContent != "" {
-// 创建内容块 - 只发送新部分
-contentChunk := createContentChunk(respID, createdTime, modelName, newContent)
-w.Write([]byte("data: " + string(contentChunk) + "\n\n"))
-flusher.Flush()
-pendingContent += newContent  // 累积内容
-}
-} else if content != "" {
-// 直接发送完整内容
-contentChunk := createContentChunk(respID, createdTime, modelName, content)
-w.Write([]byte("data: " + string(contentChunk) + "\n\n"))
-flusher.Flush()
-pendingContent += content  // 累积内容
-}
-
-// 更新前一个内容为完整内容
-if content != "" {
-previousContent = content
-}
-
-// 处理完成标志
-if choice.FinishReason != "" {
-finishReason := choice.FinishReason
-doneChunk := createDoneChunk(respID, createdTime, modelName, finishReason)
-w.Write([]byte("data: " + string(doneChunk) + "\n\n"))
-flusher.Flush()
-}
-}
-}
-}
-
-// 检查是否有累积的内容需要作为最终响应
-if pendingContent != "" {
-logInfo("[reqID:%s] 流处理完成，累积内容长度: %d", reqID, len(pendingContent))
-}
-	
-	// 发送结束信号（如果没有正常结束）
-	finishReason := "stop"
-	doneChunk := createDoneChunk(respID, createdTime, modelName, finishReason)
-	w.Write([]byte("data: " + string(doneChunk) + "\n\n"))
-	w.Write([]byte("data: [DONE]\n\n"))
-	flusher.Flush()
+    // 记录累积的内容
+    logInfo("[reqID:%s] 流处理完成，累积内容长度: %d", reqID, len(accumulatedContent))
+    
+    // 确保发送结束信号
+    if _, err := w.Write([]byte("data: [DONE]\n\n")); err != nil {
+        logError("[reqID:%s] 写入结束信号失败: %v", reqID, err)
+    }
+    flusher.Flush()
 }
 
 // 处理聊天完成请求（非流式）
@@ -1408,21 +1555,7 @@ func handleNonStreamingRequest(w http.ResponseWriter, r *http.Request, apiReq AP
 	}
 
 	// 创建HTTP请求
-	req, err := http.NewRequestWithContext(r.Context(), "POST", TargetURL, bytes.NewBuffer(reqData))
-	if err != nil {
-		logError("[reqID:%s] 创建请求失败: %v", reqID, err)
-		http.Error(w, "内部服务器错误", http.StatusInternalServerError)
-		return
-	}
-
-	// 设置请求头
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+authToken)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-
-	// 发送请求
-	client := getHTTPClient()
-	resp, err := client.Do(req)
+	resp, err := makeAPIRequestWithRetry(r.Context(), "POST", TargetURL, authToken, reqData, appConfig.MaxRetries)
 	if err != nil {
 		logError("[reqID:%s] 发送请求失败: %v", reqID, err)
 		http.Error(w, "连接到API失败", http.StatusBadGateway)
@@ -1433,8 +1566,7 @@ func handleNonStreamingRequest(w http.ResponseWriter, r *http.Request, apiReq AP
 	// 检查响应状态
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		logError("[reqID:%s] API返回非200状态码: %d, 响应: %s", reqID, resp.StatusCode, string(bodyBytes))
-		http.Error(w, fmt.Sprintf("API错误，状态码: %d", resp.StatusCode), resp.StatusCode)
+		handleAPIError(w, reqID, resp.StatusCode, bodyBytes)
 		return
 	}
 
@@ -1554,21 +1686,7 @@ func handleImageGenerations(w http.ResponseWriter, r *http.Request, apiReq APIRe
 	}
 
 	// 创建HTTP请求
-	req, err := http.NewRequestWithContext(r.Context(), "POST", TargetURL, bytes.NewBuffer(reqData))
-	if err != nil {
-		logError("[reqID:%s] 创建请求失败: %v", reqID, err)
-		http.Error(w, "内部服务器错误", http.StatusInternalServerError)
-		return
-	}
-
-	// 设置请求头
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+authToken)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-
-	// 发送请求
-	client := getHTTPClient()
-	resp, err := client.Do(req)
+	resp, err := makeAPIRequestWithRetry(r.Context(), "POST", TargetURL, authToken, reqData, appConfig.MaxRetries)
 	if err != nil {
 		logError("[reqID:%s] 发送请求失败: %v", reqID, err)
 		http.Error(w, "连接到API失败", http.StatusBadGateway)
@@ -1579,8 +1697,7 @@ func handleImageGenerations(w http.ResponseWriter, r *http.Request, apiReq APIRe
 	// 检查响应状态
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		logError("[reqID:%s] API返回非200状态码: %d, 响应: %s", reqID, resp.StatusCode, string(bodyBytes))
-		http.Error(w, fmt.Sprintf("API错误，状态码: %d", resp.StatusCode), resp.StatusCode)
+		handleAPIError(w, reqID, resp.StatusCode, bodyBytes)
 		return
 	}
 
@@ -1633,7 +1750,7 @@ func handleImageGenerations(w http.ResponseWriter, r *http.Request, apiReq APIRe
 		statusReq.Header.Set("User-Agent", "Mozilla/5.0")
 
 		// 发送请求
-		statusResp, err := client.Do(statusReq)
+		statusResp, err := getHTTPClient().Do(statusReq)
 		if err != nil {
 			logError("[reqID:%s] 发送状态请求失败: %v", reqID, err)
 			time.Sleep(6 * time.Second)
@@ -1734,21 +1851,7 @@ func handleDrawRequest(w http.ResponseWriter, r *http.Request, apiReq APIRequest
 	}
 
 	// 创建HTTP请求
-	req, err := http.NewRequestWithContext(r.Context(), "POST", TargetURL, bytes.NewBuffer(reqData))
-	if err != nil {
-		logError("[reqID:%s] 创建请求失败: %v", reqID, err)
-		http.Error(w, "内部服务器错误", http.StatusInternalServerError)
-		return
-	}
-
-	// 设置请求头
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+authToken)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-
-	// 发送请求
-	client := getHTTPClient()
-	resp, err := client.Do(req)
+	resp, err := makeAPIRequestWithRetry(r.Context(), "POST", TargetURL, authToken, reqData, appConfig.MaxRetries)
 	if err != nil {
 		logError("[reqID:%s] 发送请求失败: %v", reqID, err)
 		http.Error(w, "连接到API失败", http.StatusBadGateway)
@@ -1759,8 +1862,7 @@ func handleDrawRequest(w http.ResponseWriter, r *http.Request, apiReq APIRequest
 	// 检查响应状态
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		logError("[reqID:%s] API返回非200状态码: %d, 响应: %s", reqID, resp.StatusCode, string(bodyBytes))
-		http.Error(w, fmt.Sprintf("API错误，状态码: %d", resp.StatusCode), resp.StatusCode)
+		handleAPIError(w, reqID, resp.StatusCode, bodyBytes)
 		return
 	}
 
@@ -1813,7 +1915,7 @@ func handleDrawRequest(w http.ResponseWriter, r *http.Request, apiReq APIRequest
 		statusReq.Header.Set("User-Agent", "Mozilla/5.0")
 
 		// 发送请求
-		statusResp, err := client.Do(statusReq)
+		statusResp, err := getHTTPClient().Do(statusReq)
 		if err != nil {
 			logError("[reqID:%s] 发送状态请求失败: %v", reqID, err)
 			time.Sleep(6 * time.Second)
@@ -1887,72 +1989,76 @@ func handleDrawRequest(w http.ResponseWriter, r *http.Request, apiReq APIRequest
 	json.NewEncoder(w).Encode(completionResponse)
 }
 
-// 从流式响应中提取完整内容
+// 从流式响应中提取完整内容 - 重写版
 func extractFullContentFromStream(body io.ReadCloser, reqID string) (string, error) {
-var contentBuilder strings.Builder
+    var contentBuilder strings.Builder
+    reader := bufio.NewReaderSize(body, 16384)
+    buffer := ""
 
-// 创建读取器
-reader := bufio.NewReaderSize(body, 16384)
+    logInfo("[reqID:%s] 开始从流中提取完整内容", reqID)
 
-// 持续读取响应
-buffer := ""
-for {
-// 读取一块数据
-chunk := make([]byte, 4096)
-n, err := reader.Read(chunk)
-if err != nil {
-if err != io.EOF {
-return contentBuilder.String(), err
-}
-break
-}
+    for {
+        // 读取一块数据
+        chunk := make([]byte, 4096)
+        n, err := reader.Read(chunk)
+        if err != nil {
+            if err != io.EOF {
+                return contentBuilder.String(), fmt.Errorf("读取流数据出错: %v", err)
+            }
+            break
+        }
 
-// 添加到缓冲区
-buffer += string(chunk[:n])
+        // 添加到缓冲区并记录调试信息
+        newData := string(chunk[:n])
+        buffer += newData
+        logDebug("[reqID:%s] 提取内容 - 收到原始数据(%d字节): %s", reqID, n, truncateString(newData, 100))
 
-// 更稳健的处理方式：按行分割并只处理完整行
-lines := strings.Split(buffer, "\n")
-// 保留最后可能不完整的行
-if len(lines) > 0 {
-buffer = lines[len(lines)-1]
-}
+        // 使用双换行分割SSE消息
+        messages := strings.Split(buffer, "\n\n")
+        
+        // 保留最后一个可能不完整的消息
+        if len(messages) > 0 {
+            buffer = messages[len(messages)-1]
+            
+            // 处理所有完整的消息
+            for i := 0; i < len(messages)-1; i++ {
+                message := messages[i]
+                if !strings.HasPrefix(message, "data: ") {
+                    continue
+                }
 
-// 处理所有完整的行（除最后一行外）
-for i := 0; i < len(lines)-1; i++ {
-line := lines[i]
-if !strings.HasPrefix(line, "data: ") {
-continue
-}
+                // 提取数据部分
+                dataStr := strings.TrimPrefix(message, "data: ")
+                dataStr = strings.TrimSpace(dataStr)
 
-// 提取数据部分
-dataStr := strings.TrimPrefix(line, "data: ")
+                // 处理[DONE]消息
+                if dataStr == "[DONE]" {
+                    logDebug("[reqID:%s] 提取内容 - 收到[DONE]消息", reqID)
+                    continue
+                }
 
-// 处理[DONE]消息
-if dataStr == "[DONE]" {
-logDebug("[reqID:%s] 非流式模式收到[DONE]消息", reqID)
-continue
-}
+                // 解析JSON
+                var qwenResp QwenResponse
+                if err := json.Unmarshal([]byte(dataStr), &qwenResp); err != nil {
+                    logWarn("[reqID:%s] 提取内容 - 解析JSON失败: %v, data: %s", reqID, err, truncateString(dataStr, 100))
+                    continue
+                }
 
-// 解析JSON
-var qwenResp QwenResponse
-if err := json.Unmarshal([]byte(dataStr), &qwenResp); err != nil {
-logWarn("[reqID:%s] 解析JSON失败: %v, data: %s", reqID, err, dataStr)
-continue
-}
+                // 提取内容增量
+                for _, choice := range qwenResp.Choices {
+                    if choice.Delta.Content != "" {
+                        contentBuilder.WriteString(choice.Delta.Content)
+                        logDebug("[reqID:%s] 提取内容 - 累积增量: %s", reqID, truncateString(choice.Delta.Content, 50))
+                    }
+                }
+            }
+        }
+    }
 
-// 提取内容 - 累积所有delta内容片段
-for _, choice := range qwenResp.Choices {
-if choice.Delta.Content != "" {
-contentBuilder.WriteString(choice.Delta.Content)
-}
-}
-}
-}
-
-// 记录提取的内容长度
-contentStr := contentBuilder.String()
-logInfo("[reqID:%s] 非流式模式：成功提取完整内容，长度: %d", reqID, len(contentStr))
-return contentStr, nil
+    // 记录提取的内容长度
+    contentStr := contentBuilder.String()
+    logInfo("[reqID:%s] 非流式模式：成功提取完整内容，长度: %d", reqID, len(contentStr))
+    return contentStr, nil
 }
 
 // 上传图像到千问API
