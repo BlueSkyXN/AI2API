@@ -1616,8 +1616,14 @@ func handleStreamingRequest(w http.ResponseWriter, r *http.Request, apiReq APIRe
                 newContent = content
             }
             
+            // 以下是修复后的代码，用if语句代替三元运算符
+            truncateLen := 20
+            if appConfig.DebugEnabled {
+                truncateLen = 100
+            }
+            
             logInfo("[reqID:%s] 发送内容(%d字节): %s", reqID, len(newContent), 
-                truncateString(newContent, appConfig.DebugEnabled ? 100 : 20))
+                truncateString(newContent, truncateLen))
             
             // 发送内容块
             contentChunk := createContentChunk(respID, createdTime, modelName, newContent)
@@ -2241,33 +2247,22 @@ func handleDrawRequest(w http.ResponseWriter, r *http.Request, apiReq APIRequest
                     Content string `json:"content"`
                 } `json:"message"`
                 FinishReason string `json:"finish_reason"`
-            }{
-                {
-                    Index: 0,
-                    Message: struct {
-                        Role    string `json:"role"`
-                        Content string `json:"content"`
-                    }{
-                        Role:    "assistant",
-                        Content: fmt.Sprintf("![%s](%s)", imageURL, imageURL),
-                    },
-                    FinishReason: "stop",
-                },
             },
-            Usage: struct {
-                PromptTokens     int `json:"prompt_tokens"`
-                CompletionTokens int `json:"completion_tokens"`
-                TotalTokens      int `json:"total_tokens"`
-            }{
-                PromptTokens:     1024,
-                CompletionTokens: 1024,
-                TotalTokens:      2048,
-            },
-        }
+        },
+        Usage: struct {
+            PromptTokens     int `json:"prompt_tokens"`
+            CompletionTokens int `json:"completion_tokens"`
+            TotalTokens      int `json:"total_tokens"`
+        }{
+            PromptTokens:     1024,
+            CompletionTokens: 1024,
+            TotalTokens:      2048,
+        },
+    }
 
-        // 返回响应
-        w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(completionResponse)
+    // 返回响应
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(completionResponse)
     }
 }
 
