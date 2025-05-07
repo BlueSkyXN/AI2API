@@ -148,3 +148,48 @@ jobs:
           path: hunyuan2api-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.os == 'windows' && '.exe' || '' }}
           retention-days: 90
 
+  build-api-pool-lite:
+    name: Build api-pool-lite
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [windows, linux]
+        arch: [amd64]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+          check-latest: true
+          cache: true
+          
+      - name: Set version
+        id: set-version
+        run: |
+          echo "version=$(date +'%Y%m%d%H%M')" >> $GITHUB_OUTPUT
+          
+      - name: Build for ${{ matrix.os }}-${{ matrix.arch }}
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          VERSION: ${{ steps.set-version.outputs.version }}
+        run: |
+          # 设置文件扩展名（Windows为.exe，其他无扩展名）
+          if [ "${{ matrix.os }}" == "windows" ]; then
+            EXT=".exe"
+          else
+            EXT=""
+          fi
+          
+          BINARY_NAME="api-pool-lite-${{ matrix.os }}-${{ matrix.arch }}${EXT}"
+          go build -ldflags "-X main.AppVersion=$VERSION" -o "$BINARY_NAME" ./api-pool.go
+          
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-pool-lite-${{ matrix.os }}-${{ matrix.arch }}-${{ steps.set-version.outputs.version }}
+          path: api-pool-lite-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.os == 'windows' && '.exe' || '' }}
+          retention-days: 90
