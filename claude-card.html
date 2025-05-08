@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude 刷新倒计时 - 终极炫彩背景</title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&display=swap" rel="stylesheet">
+    
+    <style>
+        /* 页面主体样式 */
+        body {
+            font-family: 'Inter', sans-serif; /* 应用 Inter 字体 */
+            /* 全新终极炫彩背景渐变: "霓虹幻想" 主题 */
+            background: linear-gradient(135deg, 
+                #ff00ff 0%,  /* Magenta */
+                #ff0080 15%, /* Deep Pink */
+                #0077ff 30%, /* Bright Blue */
+                #00ffdd 45%, /* Cyan/Turquoise */
+                #aaff00 60%, /* Lime Green */
+                #ffaa00 75%, /* Orange */
+                #ff0000 90%, /* Red */
+                #ff00ff 100% /* Magenta (to loop smoothly for animation) */
+            );
+            background-size: 400% 400%; /* 增大背景尺寸，为动画提供更广阔的移动空间 */
+            animation: gradientAnimation 25s ease infinite; /* 应用背景渐变动画，25秒周期，平滑无限循环 */
+            color: #333; /* 页面默认文字颜色 (主要被卡片内样式覆盖) */
+            display: flex; /* 使用 Flexbox 布局 */
+            justify-content: center; /* 水平居中 */
+            align-items: center; /* 垂直居中 */
+            min-height: 100vh; /* 最小高度为视口高度，确保内容撑满屏幕 */
+            margin: 0; /* 移除默认外边距 */
+            padding: 1rem; /* 页面内边距，防止内容紧贴边缘 */
+            overflow-x: hidden; /* 防止背景动画可能导致的水平滚动条 */
+        }
+
+        /* 背景渐变动画定义 */
+        @keyframes gradientAnimation {
+            0% { background-position: 0% 50%; } /* 动画开始时背景位置 */
+            50% { background-position: 100% 50%; } /* 动画中间状态背景位置 */
+            100% { background-position: 0% 50%; } /* 动画结束时背景位置，形成循环 */
+        }
+
+        /* Bento Grid 容器样式 */
+        .bento-grid {
+            display: grid; /* 使用 Grid 布局 */
+            grid-template-columns: repeat(1, 1fr); /* 移动端默认为单列 */
+            gap: 1.5rem; /* 网格项之间的间距 */
+            width: 100%; /* 宽度占满父容器 */
+            max-width: 900px; /* 最大宽度限制，防止在大屏幕上过宽 */
+            position: relative; /* 相对定位，确保在动画背景之上 */
+            z-index: 1; /* 层级提高，确保在背景之上 */
+        }
+
+        /* 响应式设计：中等屏幕及以上 (768px) */
+        @media (min-width: 768px) {
+            .bento-grid {
+                grid-template-columns: repeat(2, 1fr); /* 变为两列布局 */
+                grid-template-rows: repeat(2, minmax(175px, auto)); /* 定义两行，每行最小高度175px */
+            }
+            /* 定义网格区域，方便控制卡片位置 */
+            .main-countdown-box { grid-area: 1 / 1 / 2 / 2; } /* 左上角卡片 */
+            .next-refresh-box { grid-area: 1 / 2 / 2 / 3; }   /* 右上角卡片 */
+            .last-refresh-box { grid-area: 2 / 1 / 3 / 2; }   /* 左下角卡片 */
+            .base-time-box { grid-area: 2 / 2 / 3 / 3; }      /* 右下角卡片 */
+        }
+
+        /* Bento Box (卡片) 通用样式 */
+        .bento-box {
+            border-radius: 1.25rem; /* 卡片圆角 */
+            padding: 1.75rem; /* 卡片内边距 */
+            box-shadow: 0 12px 45px 0 rgba(0, 0, 0, 0.4); /* 卡片阴影效果 */
+            transition: transform 0.3s ease-in-out, box-shadow 0.3s ease-in-out; /* 过渡动画：变形和阴影 */
+            display: flex; /* 使用 Flexbox 布局 */
+            flex-direction: column; /* 子元素垂直排列 */
+            justify-content: space-around; /* 子元素在垂直方向上均匀分布空间 */
+            text-align: center; /* 文字居中 */
+            color: #ffffff; /* 卡片内文字颜色为白色 */
+        }
+
+        /* 卡片鼠标悬浮效果 */
+        .bento-box:hover {
+            transform: translateY(-10px) scale(1.04); /* 轻微上移并放大 */
+            box-shadow: 0 18px 60px 0 rgba(0, 0, 0, 0.45); /* 增强阴影效果 */
+        }
+
+        /* 特定卡片的背景渐变样式 */
+        /* 左上角：下次刷新倒计时卡片 */
+        .main-countdown-box {
+            background: linear-gradient(135deg, #5433FF 0%, #20BDFF 50%, #A5FECB 100%); /* 靛蓝 -> 亮蓝 -> 薄荷绿 */
+        }
+        /* 左下角：上次刷新时间卡片 */
+        .last-refresh-box {
+            background: linear-gradient(135deg, #00b09b 0%, #96c93d 50%, #00d2ff 100%); /* 青绿 -> 亮青柠 -> 海洋蓝 */
+        }
+        /* 右上角：预计下次刷新卡片 */
+        .next-refresh-box {
+            background: linear-gradient(135deg, #6a11cb 0%, #fc00ff 50%, #00dbde 100%); /* 深紫 -> 亮粉 -> 青蓝 */
+        }
+        /* 右下角：基准刷新时间卡片 */
+        .base-time-box {
+            background: linear-gradient(135deg, #ff4e50 0%, #f9d423 50%, #ffc947 100%); /* 亮红 -> 鲜黄 -> 暖橙黄 */
+        }
+
+        /* 卡片内标题 (h2) 样式 */
+        .bento-box h2 {
+            font-size: 1.0rem; /* 字体大小 */
+            font-weight: 700; /* 字体粗细 (加粗) */
+            color: rgba(255, 255, 255, 0.95); /* 标题颜色 (略透明的白色) */
+            margin-bottom: 0.6rem; /* 标题下外边距 */
+            text-shadow: 0 1px 4px rgba(0,0,0,0.3); /* 文字阴影，增强可读性 */
+        }
+
+        /* 卡片内段落 (p) 和强调文本 (span.accent-text) 样式 */
+        .bento-box p, .bento-box span.accent-text {
+            font-size: 1.3rem; /* 字体大小 */
+            font-weight: 500; /* 字体粗细 (中等) */
+            color: #ffffff; /* 文字颜色 */
+            text-shadow: 0 1px 3px rgba(0,0,0,0.2); /* 文字阴影 */
+        }
+
+        /* 卡片内小号文本 (通常用于 "(北京时间)") 样式 */
+        .bento-box .text-sm {
+            font-size: 0.8rem; /* 字体大小 */
+            color: rgba(255, 255, 255, 0.85); /* 文字颜色 (更透明的白色) */
+            display: block; /* 块级元素，确保换行 */
+            margin-top: 0.3rem; /* 上外边距 */
+        }
+
+        /* 倒计时数字特定样式 */
+        .countdown-timer {
+            font-size: 2.85rem; /* 字体大小 */
+            font-weight: 800; /* 字体粗细 (特粗) */
+            color: #ffffff; /* 文字颜色 */
+            text-shadow: 0 2px 6px rgba(0,0,0,0.35); /* 文字阴影 */
+            letter-spacing: -0.025em; /* 字间距 */
+            margin: 0.5rem 0; /* 上下外边距 */
+        }
+
+        /* 响应式设计：小屏幕及以上 (640px) 的倒计时数字调整 */
+        @media (min-width: 640px) {
+            .countdown-timer {
+                font-size: 3.4rem; /* 增大字体 */
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="bento-grid">
+        <div class="bento-box main-countdown-box">
+            <h2>下次刷新倒计时</h2>
+            <span id="countdownDisplay" class="countdown-timer">--:--:--</span>
+        </div>
+
+        <div class="bento-box next-refresh-box">
+            <h2>预计下次刷新</h2>
+            <p><span id="nextRefreshTimeDisplay" class="accent-text">正在计算...</span><br><span class="text-sm">(北京时间)</span></p>
+        </div>
+
+        <div class="bento-box last-refresh-box">
+            <h2>上次刷新时间</h2>
+            <p><span id="lastRefreshTimeDisplay" class="accent-text">正在计算...</span><br><span class="text-sm">(北京时间)</span></p>
+        </div>
+
+        <div class="bento-box base-time-box">
+            <h2>基准刷新时间</h2>
+            <p><span id="baseTimeDisplay" class="accent-text">加载中...</span><br><span class="text-sm">(北京时间)</span></p>
+        </div>
+    </div>
+
+    <script>
+        // --- 配置常量 ---
+        // 基准刷新时间 (北京时间 ISO 8601 格式, +08:00 表示东八区)
+        // 这是计算所有未来刷新时间的基础锚点。
+        const baseRefreshTimeCST_ISO = "2025-05-08T19:00:00+08:00"; 
+        // 刷新周期 (小时)
+        const refreshIntervalHours = 5;
+        // 将刷新周期转换为毫秒
+        const intervalMilliseconds = refreshIntervalHours * 60 * 60 * 1000;
+
+        // --- DOM 元素获取 ---
+        // 获取用于显示倒计时的元素
+        const countdownDisplay = document.getElementById('countdownDisplay');
+        // 获取用于显示下一次刷新时间的元素
+        const nextRefreshTimeDisplay = document.getElementById('nextRefreshTimeDisplay');
+        // 获取用于显示上一次刷新时间的元素
+        const lastRefreshTimeDisplay = document.getElementById('lastRefreshTimeDisplay');
+        // 获取用于显示基准刷新时间的元素
+        const baseTimeDisplay = document.getElementById('baseTimeDisplay');
+
+        // --- 状态变量 ---
+        // 用于跟踪已显示的下一次刷新时间点 (Epoch毫秒数)，避免不必要的DOM更新
+        let displayedTargetTimeEpoch = 0;
+
+        // --- 辅助函数 ---
+
+        /**
+         * 计算下一次刷新时间点。
+         * 基于基准刷新时间和当前时间，向前推算直到找到第一个未来的刷新时间点。
+         * @returns {Date} 下一次刷新的 Date 对象 (内部为UTC时间)。
+         */
+        function calculateNextRefresh() {
+            // 将ISO格式的基准时间字符串转换为Date对象。
+            // Date对象内部总是以UTC存储时间。包含时区信息的字符串会被正确解析。
+            const baseTime = new Date(baseRefreshTimeCST_ISO);
+            // 获取当前时间的Date对象。
+            const now = new Date(); 
+            
+            // 从基准时间的Epoch毫秒数开始计算。
+            let nextRefreshEpoch = baseTime.getTime();
+
+            // 循环增加刷新间隔，直到计算出的刷新时间点晚于当前时间。
+            // 这样可以确保即使页面加载时已经错过了多个刷新周期，也能找到正确的下一个刷新点。
+            while (nextRefreshEpoch <= now.getTime()) {
+                nextRefreshEpoch += intervalMilliseconds;
+            }
+            // 返回计算得到的下一个刷新时间点的Date对象。
+            return new Date(nextRefreshEpoch);
+        }
+
+        /**
+         * 将 Date 对象格式化为北京时间字符串 (YYYY-MM-DD HH:MM:SS)。
+         * @param {Date} dateObj - 需要格式化的 Date 对象。
+         * @returns {string} 格式化后的北京时间字符串，或在出错时返回错误提示。
+         */
+        function formatToBeijingTime(dateObj) {
+            // 检查传入的是否是有效的Date对象。
+            if (!dateObj || isNaN(dateObj.getTime())) {
+                return "无效日期";
+            }
+            try {
+                // 使用 toLocaleString 方法进行时区转换和格式化。
+                // 'Asia/Shanghai' 代表中国标准时间 (北京时间)。
+                return dateObj.toLocaleString('zh-CN', { // 'zh-CN' 用于中文格式
+                    timeZone: 'Asia/Shanghai',
+                    year: 'numeric',    // 四位数字年份
+                    month: '2-digit',   // 两位数字月份
+                    day: '2-digit',     // 两位数字日期
+                    hour: '2-digit',    // 两位数字小时 (24小时制)
+                    minute: '2-digit',  // 两位数字分钟
+                    second: '2-digit',  // 两位数字秒
+                    hour12: false       // 使用24小时制
+                }).replace(/\//g, '-'); // 将日期中的 '/' 替换为 '-'，以符合 YYYY-MM-DD 格式。
+            } catch (e) {
+                // 如果格式化过程中发生错误，则打印错误到控制台并返回提示信息。
+                console.error("日期格式化错误:", e);
+                return "格式化错误";
+            }
+        }
+
+        // --- 主要倒计时逻辑与UI更新函数 ---
+
+        /**
+         * 更新倒计时显示以及相关的刷新时间信息。
+         * 此函数会被 setInterval 每秒调用一次。
+         */
+        function updateCountdown() {
+            // 获取当前时间。
+            const now = new Date();
+            // 计算下一次刷新时间点。
+            const targetDate = calculateNextRefresh(); // 内部为UTC
+
+            // 优化：仅当目标刷新时间点发生变化时 (即进入新的刷新周期)，才更新“下次刷新时间”和“上次刷新时间”的显示。
+            // 这样可以避免每秒都对这两个DOM元素进行不必要的重绘。
+            if (targetDate.getTime() !== displayedTargetTimeEpoch) {
+                // 更新“预计下次刷新”的显示。
+                nextRefreshTimeDisplay.textContent = formatToBeijingTime(targetDate);
+                
+                // 计算并显示“上次刷新时间”。
+                // 上次刷新时间 = 下次刷新时间 - một刷新周期。
+                const lastRefreshTimeDate = new Date(targetDate.getTime() - intervalMilliseconds);
+                lastRefreshTimeDisplay.textContent = formatToBeijingTime(lastRefreshTimeDate);
+                
+                // 更新已显示的目标时间点。
+                displayedTargetTimeEpoch = targetDate.getTime();
+            }
+
+            // 计算距离下一次刷新的剩余时间 (毫秒)。
+            const timeRemaining = targetDate.getTime() - now.getTime();
+
+            // 如果已到达或超过刷新时间点。
+            if (timeRemaining <= 0) {
+                // 将倒计时显示为 "00:00:00"。
+                countdownDisplay.textContent = "00:00:00";
+                // 在下一个 setInterval 周期，calculateNextRefresh 会自动计算出新的未来刷新点。
+                return; // 提前退出，避免显示负数。
+            }
+
+            // 将剩余毫秒数转换为时、分、秒。
+            const hours = Math.floor(timeRemaining / (1000 * 60 * 60));
+            const minutes = Math.floor((timeRemaining % (1000 * 60 * 60)) / (1000 * 60));
+            const seconds = Math.floor((timeRemaining % (1000 * 60)) / 1000);
+
+            // 格式化为 HH:MM:SS 并更新倒计时显示。
+            // String().padStart(2, '0') 用于确保单位数时前面补零 (例如 7 -> "07")。
+            countdownDisplay.textContent = 
+                `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+        }
+
+        // --- 初始化函数 ---
+
+        /**
+         * 页面加载完成后执行的初始化操作。
+         */
+        function initializePage() {
+            // 1. 显示固定的基准刷新时间。
+            const baseDate = new Date(baseRefreshTimeCST_ISO);
+            baseTimeDisplay.textContent = formatToBeijingTime(baseDate);
+
+            // 2. 立即调用一次 updateCountdown，以便页面加载时就能看到正确的初始状态。
+            updateCountdown(); 
+            
+            // 3. 设置定时器，每秒调用一次 updateCountdown 函数来实时更新倒计时。
+            setInterval(updateCountdown, 1000); // 1000毫秒 = 1秒
+        }
+
+        // --- 事件监听 ---
+        // 确保在整个HTML文档加载并解析完成后再执行初始化脚本。
+        document.addEventListener('DOMContentLoaded', initializePage);
+    </script>
+</body>
+</html>
