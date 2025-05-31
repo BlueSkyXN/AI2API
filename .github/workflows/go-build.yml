@@ -15,8 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [windows, linux]
-        arch: [amd64]
+        os: [windows, linux, darwin]
+        arch: [amd64, arm64]
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -61,8 +61,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [windows, linux]
-        arch: [amd64]
+        os: [windows, linux, darwin]
+        arch: [amd64, arm64]
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -107,8 +107,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [windows, linux]
-        arch: [amd64]
+        os: [windows, linux, darwin]
+        arch: [amd64, arm64]
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -153,8 +153,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [windows, linux]
-        arch: [amd64]
+        os: [windows, linux, darwin]
+        arch: [amd64, arm64]
     steps:
       - name: Check out code
         uses: actions/checkout@v4

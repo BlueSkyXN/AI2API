@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -28,21 +29,37 @@ type Config struct {
 // parseFlags 解析命令行参数并返回 Config 实例
 func parseFlags() *Config {
 	cfg := &Config{}
+	
+	// 基本配置
 	flag.StringVar(&cfg.KeyFile, "key-file", "", "Path to the API key file")
 	flag.StringVar(&cfg.TargetURL, "target-url", "", "Target API base URL")
 	flag.StringVar(&cfg.Port, "port", "8080", "Port to listen on")
 	flag.StringVar(&cfg.Address, "address", "localhost", "Address to listen on")
 	flag.StringVar(&cfg.Password, "password", "", "Password for client authentication")
 	
-	// 添加WorkerPool相关配置
-	maxWorkers := flag.Int("max-workers", 50, "Maximum number of worker goroutines")
-	maxQueue := flag.Int("max-queue", 500, "Maximum size of request queue")
+	// WorkerPool相关配置，直接存储到Config结构体字段中
+	flag.IntVar(&cfg.MaxWorkers, "max-workers", 50, "Maximum number of worker goroutines")
+	flag.IntVar(&cfg.MaxQueue, "max-queue", 500, "Maximum size of request queue")
+	
+	// 添加帮助信息
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExample:\n  %s --key-file=./keys.txt --target-url=https://api.example.com --password=mysecret --max-workers=100 --max-queue=1000\n", os.Args[0])
+	}
 	
 	flag.Parse()
 	
-	// 将WorkerPool配置添加到Config结构体
-	cfg.MaxWorkers = *maxWorkers
-	cfg.MaxQueue = *maxQueue
+	// 验证参数值范围
+	if cfg.MaxWorkers <= 0 {
+		log.Printf("[WARN] Invalid max-workers value %d, using default 50", cfg.MaxWorkers)
+		cfg.MaxWorkers = 50
+	}
+	
+	if cfg.MaxQueue <= 0 {
+		log.Printf("[WARN] Invalid max-queue value %d, using default 500", cfg.MaxQueue)
+		cfg.MaxQueue = 500
+	}
 	
 	return cfg
 }
@@ -460,10 +477,18 @@ func main() {
 	cfg := parseFlags()
 	if cfg.KeyFile == "" || cfg.TargetURL == "" || cfg.Password == "" {
 		log.Println("[ERROR] Missing required flags: --key-file, --target-url, --password")
+		flag.Usage()
 		os.Exit(1)
 	}
-	log.Printf("[INFO] Configuration loaded: KeyFile=%s, TargetURL=%s, Address=%s, Port=%s, MaxWorkers=%d, MaxQueue=%d", 
-		cfg.KeyFile, cfg.TargetURL, cfg.Address, cfg.Port, cfg.MaxWorkers, cfg.MaxQueue)
+	
+	// 输出实际使用的配置参数
+	log.Printf("[INFO] Starting with configuration:")
+	log.Printf("[INFO] - KeyFile: %s", cfg.KeyFile)
+	log.Printf("[INFO] - TargetURL: %s", cfg.TargetURL)
+	log.Printf("[INFO] - Address: %s", cfg.Address)
+	log.Printf("[INFO] - Port: %s", cfg.Port)
+	log.Printf("[INFO] - MaxWorkers: %d", cfg.MaxWorkers)
+	log.Printf("[INFO] - MaxQueue: %d", cfg.MaxQueue)
 
 	// 初始化密钥池
 	keyPool, err := NewKeyPool(cfg.KeyFile)
